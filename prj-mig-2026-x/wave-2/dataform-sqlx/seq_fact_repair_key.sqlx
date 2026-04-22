@@ -1,0 +1,41 @@
+-- Dataform SQLX: SEQ_FACT_REPAIR — surrogate key replacement
+-- Source: SQL Server identity column REPAIR_ORDER_KEY
+-- Target: Dataform ROW_NUMBER() OVER (ORDER BY REPAIR_START_DATE) expression
+-- Wave 2 — Recall Repair Order Completion Pipeline
+-- NOTE: This model is referenced by FACT_RECALL_REPAIR_ORDERS to ensure
+--       historical key continuity across incremental loads.
+config {
+  type: "table",
+  schema: "recall_dw",
+  description: "Repair order surrogate key registry — replaces SQL Server IDENTITY/SEQ_FACT_REPAIR. Deterministic integer per REPAIR_ORDER_ID ordered by REPAIR_START_DATE.",
+  bigquery: {
+    clusterBy: ["REPAIR_ORDER_ID"]
+  },
+  tags: ["wave-2", "service-domain", "keys"]
+}
+
+-- Strategy: assign integer keys in the same chronological order the SQL Server
+-- identity would have, using REPAIR_START_DATE as the ordering proxy.
+WITH first_seen AS (
+  SELECT
+    REPAIR_ORDER_ID,
+    MIN(CAST(REPAIR_START_DATE AS DATE)) AS REPAIR_START_DATE
+  FROM ${ref("RECALL_REPAIR_ORDERS_EXT")}
+  WHERE REPAIR_ORDER_ID IS NOT NULL
+  GROUP BY REPAIR_ORDER_ID
+)
+SELECT
+  -- Offset by 100000 to avoid collision with any legacy identity values
+  -- if a parallel-run coexistence period requires both systems to write keys
+  100000 + ROW_NUMBER() OVER (ORDER BY REPAIR_START_DATE, REPAIR_ORDER_ID) AS REPAIR_ORDER_KEY,
+  REPAIR_ORDER_ID,
+  REPAIR_START_DATE,
+  CURRENT_TIMESTAMP() AS _GENERATED_AT
+FROM first_seen
+
+pre_operations {
+  ASSERT (
+    SELECT COUNT(*) = COUNT(DISTINCT REPAIR_ORDER_ID)
+    FROM ${self()}
+  ) AS "SEQ_FACT_REPAIR: duplicate REPAIR_ORDER_ID in key registry"
+}

@@ -1,0 +1,35 @@
+-- Dataform SQLX: FACT_CAMPAIGN_VEHICLE completion sync MERGE
+-- Written by PKG_LOAD_FACT_RECALL_REPAIR_ORDERS after repair orders land.
+-- Wave 2 — Recall Repair Order Completion Pipeline
+config {
+  type: "incremental",
+  schema: "recall_dw",
+  description: "Completion sync — updates STATUS and DAYS_TO_REPAIR from FACT_RECALL_REPAIR_ORDERS",
+  uniqueKey: ["CAMPAIGN_KEY", "VEHICLE_GOLDEN_KEY"],
+  tags: ["wave-2", "completion-sync"]
+}
+
+WITH vin_key_map AS (
+  SELECT
+    r.CAMPAIGN_KEY,
+    r.REPAIR_ORDER_KEY,
+    v.VEHICLE_GOLDEN_KEY,
+    r.REPAIR_STATUS,
+    r.REPAIR_END_DATE,
+    DATE_DIFF(r.REPAIR_END_DATE, r.REPAIR_START_DATE, DAY) AS DAYS_TO_REPAIR
+  FROM
+    ${ref("FACT_RECALL_REPAIR_ORDERS")} r
+    JOIN ${ref("DIM_VEHICLE_GOLDEN")}   v ON r.VEHICLE_ID = v.VEHICLE_ID
+  WHERE
+    r.REPAIR_STATUS = 'COMPLETED'
+    AND r.QC_PASS_FLAG = TRUE
+)
+SELECT
+  vkm.CAMPAIGN_KEY,
+  vkm.VEHICLE_GOLDEN_KEY,
+  'COMPLETED'          AS STATUS,
+  vkm.REPAIR_ORDER_KEY AS APPOINTMENT_KEY,
+  vkm.DAYS_TO_REPAIR,
+  vkm.REPAIR_END_DATE  AS REPAIR_COMPLETION_DATE,
+  CURRENT_TIMESTAMP()  AS _LAST_MODIFIED_AT
+FROM vin_key_map vkm

@@ -1,0 +1,41 @@
+-- Dataform SQLX: SP_ENROL_NEW_ELIGIBLE_VEHICLES → idempotent MERGE
+-- Replaces Oracle PL/SQL cursor-based procedure.
+-- Wave 2 — Campaign Vehicle Enrolment Pipeline
+config {
+  type: "incremental",
+  schema: "recall_dw",
+  description: "Enrol newly eligible vehicles into active campaigns — idempotent MERGE",
+  uniqueKey: ["CAMPAIGN_KEY", "VEHICLE_GOLDEN_KEY"],
+  tags: ["wave-2", "campaign-domain"]
+}
+
+WITH eligible AS (
+  SELECT
+    c.CAMPAIGN_KEY,
+    v.VEHICLE_GOLDEN_KEY,
+    v.VEHICLE_ID,
+    CURRENT_DATE()  AS ENROLMENT_DATE,
+    'PENDING'       AS STATUS
+  FROM
+    ${ref("DIM_RECALL_CAMPAIGN")}  c
+    JOIN ${ref("DIM_VEHICLE_GOLDEN")} v
+      ON v.RECALL_ELIGIBLE_FLAG = TRUE
+     AND v.COMPLETENESS_STATE   = 'COMPLETE'
+  WHERE
+    c.CAMPAIGN_STATUS = 'ACTIVE'
+)
+SELECT
+  e.CAMPAIGN_KEY,
+  e.VEHICLE_GOLDEN_KEY,
+  e.VEHICLE_ID,
+  e.ENROLMENT_DATE,
+  e.STATUS,
+  NULL               AS APPOINTMENT_KEY,
+  NULL               AS DAYS_TO_REPAIR,
+  CURRENT_TIMESTAMP() AS _LOADED_AT
+FROM eligible e
+WHERE NOT EXISTS (
+  SELECT 1 FROM ${self()} existing
+  WHERE  existing.CAMPAIGN_KEY       = e.CAMPAIGN_KEY
+    AND  existing.VEHICLE_GOLDEN_KEY = e.VEHICLE_GOLDEN_KEY
+)

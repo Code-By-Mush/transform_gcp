@@ -1,0 +1,89 @@
+-- Dataform SQLX: PKG_MERGE_VEHICLE_GOLDEN
+-- Source: SSIS package PKG_MERGE_VEHICLE_GOLDEN (SQL Server + Oracle)
+-- Target: Cloud Dataform workflow — full scheduled replace with data checks
+-- Wave 1 — Vehicle Golden Profile
+-- Replaces: SSIS join + branch transforms + reject routing
+config {
+  type: "table",
+  schema: "recall_dw",
+  description: "Full-replace workflow that merges DIM_VEHICLE_MASTER + DIM_VEHICLE_OWNERSHIP into DIM_VEHICLE_GOLDEN, routes orphans to DW_ETL_REJECTS",
+  bigquery: {
+    clusterBy: ["VEHICLE_ID"]
+  },
+  tags: ["wave-1", "vehicle-domain", "golden", "pkg-replacement"]
+}
+
+WITH master_current AS (
+  -- Only current SCD rows from vehicle master
+  SELECT * FROM ${ref("DIM_VEHICLE_MASTER")}
+  WHERE IS_CURRENT = TRUE
+),
+ownership_current AS (
+  -- Only current ownership rows
+  SELECT * FROM ${ref("DIM_VEHICLE_OWNERSHIP")}
+  WHERE IS_CURRENT_OWNER = TRUE
+),
+merged AS (
+  SELECT
+    COALESCE(m.VEHICLE_KEY, o.OWNERSHIP_KEY)          AS VEHICLE_GOLDEN_KEY,
+    COALESCE(m.VEHICLE_ID,  o.VEHICLE_ID)            AS VEHICLE_ID,
+    m.MAKE,
+    m.MODEL,
+    m.MODEL_YEAR,
+    m.ENGINE_TYPE,
+    m.BUILD_DATE,
+    m.RECALL_ELIGIBLE_FLAG,
+    o.CURRENT_OWNER_CUSTOMER_KEY,
+    o.OWNERSHIP_START_DATE,
+    o.TRANSFER_REASON,
+    o.OWNER_TYPE,
+    -- Completeness state (replaces SSIS branching logic)
+    CASE
+      WHEN m.VEHICLE_KEY IS NULL AND o.OWNERSHIP_KEY IS NOT NULL THEN 'OWNERSHIP_ONLY'
+      WHEN m.VEHICLE_KEY IS NOT NULL AND o.OWNERSHIP_KEY IS NULL THEN 'MASTER_ONLY'
+      ELSE 'COMPLETE'
+    END                                               AS COMPLETENESS_STATE,
+    CURRENT_TIMESTAMP()                               AS _REFRESHED_AT
+  FROM
+    master_current    m
+    FULL OUTER JOIN ownership_current o ON m.VEHICLE_ID = o.VEHICLE_ID
+),
+-- Accepted rows (replaces SSIS "Acceptable" output path)
+accepted AS (
+  SELECT * FROM merged
+  WHERE COMPLETENESS_STATE = 'COMPLETE'
+    AND VEHICLE_ID IS NOT NULL
+),
+-- Rejected/orphan rows (replaces SSIS "Investigatory" output path → DW_ETL_REJECTS)
+rejected AS (
+  SELECT
+    VEHICLE_ID,
+    COMPLETENESS_STATE AS REJECT_REASON
+  FROM merged
+  WHERE COMPLETENESS_STATE != 'COMPLETE'
+)
+-- Main output: only accepted golden rows
+SELECT * FROM accepted
+
+post_operations {
+  -- Route orphans to DW_ETL_REJECTS (replaces SSIS reject destination)
+  INSERT INTO `my-gcp-project.recall_dw.DW_ETL_REJECTS`
+    (REJECT_ID, SOURCE_SYSTEM, SOURCE_TABLE, REJECT_REASON, REJECTED_AT)
+  SELECT
+    CAST(UNIX_MICROS(CURRENT_TIMESTAMP()) + ROW_NUMBER() OVER () AS INT64),
+    'DATAFORM',
+    'PKG_MERGE_VEHICLE_GOLDEN',
+    CONCAT(VEHICLE_ID, ' — ', REJECT_REASON),
+    CURRENT_TIMESTAMP()
+  FROM (
+    SELECT
+      COALESCE(m.VEHICLE_ID, o.VEHICLE_ID) AS VEHICLE_ID,
+      CASE
+        WHEN m.VEHICLE_KEY IS NULL THEN 'OWNERSHIP_ONLY'
+        ELSE 'MASTER_ONLY'
+      END AS REJECT_REASON
+    FROM master_current m
+    FULL OUTER JOIN ownership_current o ON m.VEHICLE_ID = o.VEHICLE_ID
+    WHERE m.VEHICLE_KEY IS NULL OR o.OWNERSHIP_KEY IS NULL
+  )
+}

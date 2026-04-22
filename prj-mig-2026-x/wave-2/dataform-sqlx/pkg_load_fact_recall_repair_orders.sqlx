@@ -1,0 +1,80 @@
+-- Dataform SQLX: PKG_LOAD_FACT_RECALL_REPAIR_ORDERS
+-- Source: SSIS package PKG_LOAD_FACT_RECALL_REPAIR_ORDERS (4-hourly watermark + completion sync)
+-- Target: Cloud Dataform SQLX — incremental load + cross-table completion sync MERGE
+-- Wave 2 — Recall Repair Order Completion Pipeline
+-- Orchestrated by Cloud Composer (4-hourly schedule, slot contention handled via Composer pool)
+config {
+  type: "incremental",
+  schema: "recall_dw",
+  description: "4-hourly incremental load of repair orders + completion sync MERGE that writes STATUS/DAYS_TO_REPAIR back to FACT_CAMPAIGN_VEHICLE. Replaces SSIS PKG_LOAD_FACT_RECALL_REPAIR_ORDERS.",
+  uniqueKey: ["REPAIR_ORDER_KEY"],
+  bigquery: {
+    partitionBy: "REPAIR_START_DATE",
+    clusterBy: ["CAMPAIGN_KEY", "DEALER_KEY"],
+    updatePartitionFilter: "REPAIR_START_DATE >= DATE_SUB(CURRENT_DATE(), INTERVAL 60 DAY)"
+  },
+  tags: ["wave-2", "service-domain", "completion-sync"]
+}
+
+WITH source AS (
+  SELECT
+    keys.REPAIR_ORDER_KEY,
+    c.CAMPAIGN_KEY,
+    d.DEALER_KEY,
+    vg.VEHICLE_GOLDEN_KEY,
+    CAST(src.REPAIR_START_DATE AS DATE)  AS REPAIR_START_DATE,
+    CAST(src.REPAIR_END_DATE   AS DATE)  AS REPAIR_END_DATE,
+    src.REPAIR_STATUS,
+    src.QC_PASS_FLAG = 'Y'               AS QC_PASS_FLAG,
+    src.TECHNICIAN_ID,
+    CAST(src.PARTS_COST    AS NUMERIC)   AS PARTS_COST,
+    CAST(src.LABOUR_HOURS  AS FLOAT64)   AS LABOUR_HOURS,
+    -- IS_BUSINESS_DAY scalar function (replaces DIM_DATE.IS_BUSINESS_DAY join)
+    DATE_DIFF(
+      CAST(src.REPAIR_END_DATE   AS DATE),
+      CAST(src.REPAIR_START_DATE AS DATE),
+      DAY
+    )                                    AS BUSINESS_DAYS_TAKEN,
+    'SERVICE_SCHED_OLTP'                 AS _SOURCE_SYSTEM,
+    CURRENT_TIMESTAMP()                  AS _LOADED_AT,
+    CURRENT_TIMESTAMP()                  AS _LAST_MODIFIED_AT
+  FROM
+    ${ref("RECALL_REPAIR_ORDERS_EXT")}  src
+    JOIN ${ref("SEQ_FACT_REPAIR_KEY")}  keys ON src.REPAIR_ORDER_ID = keys.REPAIR_ORDER_ID
+    JOIN ${ref("DIM_RECALL_CAMPAIGN")}  c    ON src.CAMPAIGN_ID     = c.CAMPAIGN_ID
+    JOIN ${ref("DIM_DEALER")}           d    ON src.DEALER_ID       = d.DEALER_ID  AND d.IS_CURRENT = TRUE
+    JOIN ${ref("DIM_VEHICLE_GOLDEN")}   vg   ON src.VEHICLE_ID      = vg.VEHICLE_ID
+  WHERE
+    CAST(src.LAST_MODIFIED_DATE AS TIMESTAMP) > CAST(
+      '{{ var("RECALL_REPAIR_ORDERS__HIGH_WATER_MARK", "2024-01-01T00:00:00") }}' AS TIMESTAMP
+    )
+)
+SELECT * FROM source
+
+post_operations {
+  -- ── Completion sync MERGE back into FACT_CAMPAIGN_VEHICLE ─────────────────
+  -- Replaces: SSIS cross-package STATUS write (4-hourly schedule)
+  -- Declared as explicit dependency in Dataform graph so enrolment runs first.
+  MERGE `my-gcp-project.recall_dw.FACT_CAMPAIGN_VEHICLE` AS tgt
+  USING (
+    SELECT
+      r.CAMPAIGN_KEY,
+      r.VEHICLE_GOLDEN_KEY,
+      'COMPLETED'          AS STATUS,
+      r.REPAIR_ORDER_KEY   AS APPOINTMENT_KEY,
+      DATE_DIFF(r.REPAIR_END_DATE, r.REPAIR_START_DATE, DAY) AS DAYS_TO_REPAIR,
+      r.REPAIR_END_DATE    AS REPAIR_COMPLETION_DATE,
+      CURRENT_TIMESTAMP()  AS _LAST_MODIFIED_AT
+    FROM ${self()} r
+    WHERE r.REPAIR_STATUS = 'COMPLETED'
+      AND r.QC_PASS_FLAG  = TRUE
+  ) AS src
+  ON  tgt.CAMPAIGN_KEY       = src.CAMPAIGN_KEY
+  AND tgt.VEHICLE_GOLDEN_KEY = src.VEHICLE_GOLDEN_KEY
+  WHEN MATCHED THEN UPDATE SET
+    tgt.STATUS               = src.STATUS,
+    tgt.APPOINTMENT_KEY      = src.APPOINTMENT_KEY,
+    tgt.DAYS_TO_REPAIR       = src.DAYS_TO_REPAIR,
+    tgt.REPAIR_COMPLETION_DATE = src.REPAIR_COMPLETION_DATE,
+    tgt._LAST_MODIFIED_AT    = src._LAST_MODIFIED_AT
+}

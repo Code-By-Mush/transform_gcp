@@ -1,0 +1,63 @@
+-- Dataform SQLX: DIM_VEHICLE_OWNERSHIP — incremental MERGE
+-- Source: SQL Server DW multi-step ownership update procedure
+-- Target: Cloud Dataform incremental model
+-- Wave 1 — Vehicle Golden Profile
+config {
+  type: "incremental",
+  schema: "recall_dw",
+  description: "Vehicle ownership history — incremental MERGE handling multi-step transfers, fleet vs private, null end-dates",
+  uniqueKey: ["VEHICLE_ID", "OWNERSHIP_START_DATE"],
+  bigquery: {
+    partitionBy: "OWNERSHIP_START_DATE",
+    clusterBy: ["VEHICLE_ID"],
+    updatePartitionFilter: "OWNERSHIP_START_DATE >= DATE_SUB(CURRENT_DATE(), INTERVAL 180 DAY)"
+  },
+  tags: ["wave-1", "vehicle-domain"]
+}
+
+WITH source AS (
+  SELECT
+    ROW_NUMBER() OVER (ORDER BY src.VEHICLE_ID, src.OWNERSHIP_START_DATE) AS OWNERSHIP_KEY,
+    src.VEHICLE_ID,
+    src.CUSTOMER_KEY                              AS CURRENT_OWNER_CUSTOMER_KEY,
+    src.OWNER_TYPE,
+    src.TRANSFER_REASON,
+    src.OWNERSHIP_START_DATE,
+    src.OWNERSHIP_END_DATE,
+    src.OWNERSHIP_END_DATE IS NULL                AS IS_CURRENT_OWNER,
+    src.REGISTRATION_NUMBER,
+    src.REGISTRATION_COUNTRY,
+    'SQL_SERVER_DW'                               AS _SOURCE_SYSTEM,
+    CURRENT_TIMESTAMP()                           AS _LOADED_AT
+  FROM
+    ${ref("STG_VEHICLE_OWNERSHIP_EXTRACT")} src
+  WHERE
+    src.OWNERSHIP_START_DATE > CAST(
+      '{{ var("DIM_VEHICLE_OWNERSHIP__HIGH_WATER_MARK", "2018-01-01") }}' AS DATE
+    )
+),
+-- Close out previous current-owner rows before inserting new ownership
+close_previous AS (
+  UPDATE ${self()} tgt
+  SET
+    OWNERSHIP_END_DATE = src.OWNERSHIP_START_DATE,
+    IS_CURRENT_OWNER   = FALSE
+  FROM source src
+  WHERE tgt.VEHICLE_ID      = src.VEHICLE_ID
+    AND tgt.IS_CURRENT_OWNER = TRUE
+    AND src.OWNERSHIP_END_DATE IS NULL   -- only close when a new current row arrives
+)
+SELECT * FROM source
+
+pre_operations {
+  -- Assert: no vehicle has two IS_CURRENT_OWNER = TRUE rows after merge
+  ASSERT (
+    SELECT COUNT(*) = 0
+    FROM (
+      SELECT VEHICLE_ID, COUNTIF(IS_CURRENT_OWNER) AS current_cnt
+      FROM   ${self()}
+      GROUP BY VEHICLE_ID
+      HAVING current_cnt > 1
+    )
+  ) AS "DIM_VEHICLE_OWNERSHIP: multiple current-owner rows detected for same vehicle"
+}

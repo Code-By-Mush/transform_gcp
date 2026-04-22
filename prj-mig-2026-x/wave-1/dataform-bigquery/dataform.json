@@ -1,0 +1,7 @@
+{
+  "warehouse": "bigquery",
+  "defaultDatabase": "leapdataos",
+  "defaultSchema": "recall_dw",
+  "defaultLocation": "US",
+  "assertionSchema": "recall_dw"
+}

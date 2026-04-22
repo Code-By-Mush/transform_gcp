@@ -1,0 +1,70 @@
+-- Dataform SQLX: load_dealer_data
+-- Source: Oracle procedure load_dealer_data (row-level validation + staging inserts)
+-- Target: Cloud Dataform incremental SQL with pre-run data checks
+-- Wave 1 — Dealer Hierarchy Network
+-- Replaces: PL/SQL cursor validation loop + conditional INSERT/UPDATE
+config {
+  type: "incremental",
+  schema: "recall_dw_staging",
+  description: "Validated dealer staging load — replaces Oracle load_dealer_data procedure. Row-level validation expressed as Dataform assertions; rejects routed to DW_ETL_REJECTS.",
+  uniqueKey: ["DEALER_ID", "LOAD_DATE"],
+  bigquery: {
+    partitionBy: "LOAD_DATE"
+  },
+  tags: ["wave-1", "dealer-domain"]
+}
+
+WITH raw AS (
+  SELECT *
+  FROM ${ref("EXT_DEALER_MASTER")}
+  WHERE CAST(REGEXP_EXTRACT(_FILE_NAME, r'(\d{8})') AS DATE FORMAT 'YYYYMMDD')
+      > CAST('{{ var("STG_DEALER_MASTER__HIGH_WATER_MARK", "2020-01-01") }}' AS DATE)
+),
+validated AS (
+  SELECT
+    ROW_NUMBER() OVER (ORDER BY LOAD_DATE, DEALER_ID) AS STG_ID,
+    NULL                                              AS BATCH_ID,   -- set by Composer XCom
+    DEALER_ID,
+    DEALER_NAME,
+    DEALER_TYPE,
+    REGION_CODE,
+    COUNTRY_CODE,
+    PARENT_DEALER_ID,
+    ADDRESS_LINE_1,
+    CITY,
+    POSTAL_CODE,
+    PHONE,
+    EMAIL,
+    CAST(LOAD_DATE AS DATE)                           AS LOAD_DATE,
+    -- Validation flags (replaces Oracle cursor branching)
+    DEALER_ID IS NOT NULL
+      AND LENGTH(TRIM(DEALER_ID)) > 0                AS IS_VALID,
+    TO_JSON_STRING(
+      ARRAY_REMOVE([
+        IF(DEALER_ID IS NULL,       'DEALER_ID is null',       NULL),
+        IF(LENGTH(DEALER_NAME) = 0, 'DEALER_NAME is empty',    NULL),
+        IF(REGION_CODE IS NULL,     'REGION_CODE missing',     NULL)
+      ], NULL)
+    )                                                 AS VALIDATION_ERRORS,
+    _FILE_NAME                                        AS _SOURCE_FILE,
+    CURRENT_TIMESTAMP()                               AS _LOADED_AT
+  FROM raw
+)
+SELECT * FROM validated
+WHERE IS_VALID = TRUE   -- invalid rows handled in post_operations reject route
+
+post_operations {
+  INSERT INTO `my-gcp-project.recall_dw.DW_ETL_REJECTS`
+    (REJECT_ID, SOURCE_SYSTEM, SOURCE_TABLE, REJECT_REASON, REJECTED_AT)
+  SELECT
+    CAST(UNIX_MICROS(CURRENT_TIMESTAMP()) + ROW_NUMBER() OVER () AS INT64),
+    'EXT_DEALER_MASTER',
+    'STG_DEALER_MASTER',
+    CONCAT(DEALER_ID, ': ', VALIDATION_ERRORS),
+    CURRENT_TIMESTAMP()
+  FROM (
+    SELECT DEALER_ID, VALIDATION_ERRORS
+    FROM ${self()}
+    WHERE IS_VALID = FALSE
+  )
+}

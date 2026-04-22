@@ -1,0 +1,38 @@
+-- Dataform SQLX: DIM_VEHICLE_GOLDEN
+-- Full table replace on schedule — merges DIM_VEHICLE_MASTER + DIM_VEHICLE_OWNERSHIP
+-- Wave 1 — Vehicle Golden Profile
+config {
+  type: "table",
+  schema: "recall_dw",
+  description: "Golden vehicle record — outer join of master + ownership, completeness states, quarantine routing",
+  bigquery: {
+    clusterBy: ["VEHICLE_ID"]
+  },
+  tags: ["wave-1", "vehicle-domain", "golden"]
+}
+
+SELECT
+  COALESCE(m.VEHICLE_KEY, o.VEHICLE_KEY)  AS VEHICLE_GOLDEN_KEY,
+  COALESCE(m.VEHICLE_ID,  o.VEHICLE_ID)  AS VEHICLE_ID,
+  m.MAKE,
+  m.MODEL,
+  m.MODEL_YEAR,
+  m.ENGINE_TYPE,
+  m.BUILD_DATE,
+  m.RECALL_ELIGIBLE_FLAG,
+  o.CURRENT_OWNER_CUSTOMER_KEY,
+  o.OWNERSHIP_START_DATE,
+  o.TRANSFER_REASON,
+  CASE
+    WHEN m.VEHICLE_KEY IS NULL THEN 'OWNERSHIP_ONLY'
+    WHEN o.VEHICLE_KEY IS NULL THEN 'MASTER_ONLY'
+    ELSE 'COMPLETE'
+  END                                     AS COMPLETENESS_STATE,
+  CURRENT_TIMESTAMP()                     AS _REFRESHED_AT
+FROM
+  ${ref("DIM_VEHICLE_MASTER")}  m
+  FULL OUTER JOIN ${ref("DIM_VEHICLE_OWNERSHIP")} o
+    ON m.VEHICLE_ID = o.VEHICLE_ID
+   AND m.IS_CURRENT = TRUE
+WHERE
+  COALESCE(m.VEHICLE_KEY, o.VEHICLE_KEY) IS NOT NULL

@@ -1,0 +1,10 @@
+{
+  "name": "prj-mig-2026-x-wave1-dataform",
+  "private": true,
+  "dependencies": {
+    "@dataform/core": "3.0.13"
+  },
+  "devDependencies": {
+    "@dataform/cli": "3.0.13"
+  }
+}

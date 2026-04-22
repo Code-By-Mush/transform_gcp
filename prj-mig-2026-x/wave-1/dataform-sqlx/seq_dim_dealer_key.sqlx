@@ -1,0 +1,40 @@
+-- Dataform SQLX: SEQ_DIM_DEALER — surrogate key replacement
+-- Source: Oracle SEQUENCE SEQ_DIM_DEALER (cached, not portable to BigQuery)
+-- Target: Cloud Dataform ROW_NUMBER() key generation
+-- Wave 1 — Dealer Hierarchy Network
+-- NOTE: This is a shared model consumed by load_dealer_data and load_dim_dealer.
+--       It materialises a stable integer key per DEALER_ID using historical ordering.
+config {
+  type: "table",
+  schema: "recall_dw",
+  description: "Dealer surrogate key registry — replaces Oracle SEQ_DIM_DEALER. Deterministic integer per DEALER_ID ordered by first-seen date.",
+  bigquery: {
+    clusterBy: ["DEALER_ID"]
+  },
+  tags: ["wave-1", "dealer-domain", "keys"]
+}
+
+-- Strategy: assign keys in the same ascending order the Oracle sequence would have,
+-- using the earliest LOAD_DATE the dealer was first seen in staging.
+WITH first_seen AS (
+  SELECT
+    DEALER_ID,
+    MIN(LOAD_DATE) AS FIRST_SEEN_DATE
+  FROM ${ref("STG_DEALER_MASTER")}
+  WHERE IS_VALID = TRUE
+  GROUP BY DEALER_ID
+)
+SELECT
+  -- Start from 1001 to leave room for system/test rows, matching legacy Oracle cache offset
+  1000 + ROW_NUMBER() OVER (ORDER BY FIRST_SEEN_DATE, DEALER_ID) AS DEALER_KEY,
+  DEALER_ID,
+  FIRST_SEEN_DATE,
+  CURRENT_TIMESTAMP() AS _GENERATED_AT
+FROM first_seen
+
+pre_operations {
+  ASSERT (
+    SELECT COUNT(*) = COUNT(DISTINCT DEALER_ID)
+    FROM ${self()}
+  ) AS "SEQ_DIM_DEALER: duplicate DEALER_ID in key registry"
+}

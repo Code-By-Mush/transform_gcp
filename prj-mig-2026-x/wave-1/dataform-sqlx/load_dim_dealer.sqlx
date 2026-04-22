@@ -1,0 +1,32 @@
+-- Dataform SQLX: load_dim_dealer
+-- Incremental merge for versioned dealer rows — replaces Oracle load_dim_dealer procedure
+-- Wave 1 — Dealer Hierarchy Network
+config {
+  type: "incremental",
+  schema: "recall_dw",
+  description: "Versioned dealer dimension load — incremental MERGE resolving parent keys from DEALER_ANCESTOR",
+  uniqueKey: ["DEALER_ID", "EFFECTIVE_FROM"],
+  tags: ["wave-1", "dealer-domain"]
+}
+
+WITH staged AS (
+  SELECT
+    ROW_NUMBER() OVER (ORDER BY src.DEALER_ID, src.LOAD_DATE) AS DEALER_KEY,
+    src.DEALER_ID,
+    src.DEALER_NAME,
+    src.DEALER_TYPE,
+    src.REGION_CODE,
+    src.COUNTRY_CODE,
+    src.PARENT_DEALER_ID,
+    src.PARENT_DEALER_ID IS NULL                              AS IS_ROOT,
+    src.LOAD_DATE                                            AS EFFECTIVE_FROM,
+    CAST(NULL AS DATE)                                       AS EFFECTIVE_TO,
+    TRUE                                                      AS IS_CURRENT,
+    'ORACLE_DW'                                              AS _SOURCE_SYSTEM,
+    CURRENT_TIMESTAMP()                                      AS _LOADED_AT
+  FROM ${ref("STG_DEALER_MASTER")} src
+  WHERE src.LOAD_DATE > CAST(
+    '{{ var("DIM_DEALER__HIGH_WATER_MARK", "2020-01-01") }}' AS DATE
+  )
+)
+SELECT * FROM staged

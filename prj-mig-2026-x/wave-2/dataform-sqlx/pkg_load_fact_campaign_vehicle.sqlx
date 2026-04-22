@@ -1,0 +1,57 @@
+-- Dataform SQLX: PKG_LOAD_FACT_CAMPAIGN_VEHICLE
+-- Source: SSIS package PKG_LOAD_FACT_CAMPAIGN_VEHICLE (in-memory #VIN_KEY_MAP temp table)
+-- Target: Cloud Dataform incremental MERGE — BigQuery staging table replaces #VIN_KEY_MAP
+-- Wave 2 — Campaign Vehicle Enrolment Pipeline
+config {
+  type: "incremental",
+  schema: "recall_dw",
+  description: "Incremental MERGE for FACT_CAMPAIGN_VEHICLE — VIN-to-VEHICLE_GOLDEN_KEY resolution via BigQuery staging table (replaces SSIS #VIN_KEY_MAP in-memory temp table)",
+  uniqueKey: ["CAMPAIGN_KEY", "VEHICLE_GOLDEN_KEY"],
+  bigquery: {
+    partitionBy: "ENROLMENT_DATE",
+    clusterBy: ["CAMPAIGN_KEY", "VEHICLE_GOLDEN_KEY"],
+    updatePartitionFilter: "ENROLMENT_DATE >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)"
+  },
+  tags: ["wave-2", "campaign-domain"]
+}
+
+-- ── VIN key resolution staging table (replaces SSIS #VIN_KEY_MAP temp table) ──
+-- In SQL Server SSIS, #VIN_KEY_MAP was an in-memory temp table built per batch.
+-- In BigQuery, this is a CTE (or intermediate Dataform model) — no temp tables.
+WITH vin_key_map AS (
+  SELECT
+    src.VEHICLE_ID,
+    src.CAMPAIGN_ID,
+    vg.VEHICLE_GOLDEN_KEY,
+    vg.CURRENT_OWNER_CUSTOMER_KEY AS CUSTOMER_KEY,
+    c.CAMPAIGN_KEY
+  FROM
+    ${ref("CAMPAIGN_VEHICLE_EXT")}  src
+    JOIN ${ref("DIM_VEHICLE_GOLDEN")}   vg ON src.VEHICLE_ID  = vg.VEHICLE_ID
+    JOIN ${ref("DIM_RECALL_CAMPAIGN")}  c  ON src.CAMPAIGN_ID = c.CAMPAIGN_ID
+  WHERE
+    CAST(src.EXTRACT_DATE AS DATE) > CAST(
+      '{{ var("FACT_CAMPAIGN_VEHICLE__HIGH_WATER_MARK", "2024-01-01") }}' AS DATE
+    )
+    AND vg.COMPLETENESS_STATE = 'COMPLETE'
+),
+enriched AS (
+  SELECT
+    ROW_NUMBER() OVER (ORDER BY vkm.CAMPAIGN_KEY, vkm.VEHICLE_GOLDEN_KEY) AS CAMPAIGN_VEHICLE_KEY,
+    vkm.CAMPAIGN_KEY,
+    vkm.VEHICLE_GOLDEN_KEY,
+    vkm.CUSTOMER_KEY,
+    CAST(src.ENROLMENT_DATE AS DATE)  AS ENROLMENT_DATE,
+    COALESCE(src.ENROLMENT_STATUS, 'PENDING') AS STATUS,
+    NULL                              AS APPOINTMENT_KEY,
+    NULL                              AS DAYS_TO_REPAIR,
+    NULL                              AS REPAIR_COMPLETION_DATE,
+    'SSIS_STREAM_B_DATAFORM'          AS _SOURCE_SYSTEM,
+    CURRENT_TIMESTAMP()               AS _LOADED_AT,
+    CURRENT_TIMESTAMP()               AS _LAST_MODIFIED_AT
+  FROM vin_key_map vkm
+  JOIN ${ref("CAMPAIGN_VEHICLE_EXT")} src
+    ON vkm.VEHICLE_ID  = src.VEHICLE_ID
+   AND vkm.CAMPAIGN_ID = src.CAMPAIGN_ID
+)
+SELECT * FROM enriched
